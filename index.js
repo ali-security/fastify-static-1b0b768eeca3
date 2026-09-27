@@ -3,6 +3,7 @@
 const path = require('node:path')
 const { fileURLToPath } = require('node:url')
 const { statSync } = require('node:fs')
+const { readdir, stat } = require('node:fs/promises')
 const { glob } = require('glob')
 const fp = require('fastify-plugin')
 const send = require('@fastify/send')
@@ -92,7 +93,9 @@ async function fastifyStatic (fastify, opts) {
         filePath,
         root || sendOptions.root,
         0,
-        opts
+        opts,
+        undefined,
+        allowedPath !== undefined
       )
       return this
     })
@@ -107,7 +110,16 @@ async function fastifyStatic (fastify, opts) {
         // Set content disposition header
         this.header('content-disposition', contentDisposition(fileName))
 
-        pumpSendToReply(this.request, this, filePath, root, 0, opts)
+        pumpSendToReply(
+          this.request,
+          this,
+          filePath,
+          root,
+          0,
+          opts,
+          undefined,
+          allowedPath !== undefined
+        )
 
         return this
       }
@@ -136,7 +148,16 @@ async function fastifyStatic (fastify, opts) {
             return reply.callNotFound()
           }
 
-          pumpSendToReply(req, reply, pathname, sendOptions.root)
+          pumpSendToReply(
+            req,
+            reply,
+            pathname,
+            sendOptions.root,
+            0,
+            undefined,
+            undefined,
+            true
+          )
         }
       })
       if (opts.redirect === true && prefix !== opts.prefix) {
@@ -221,6 +242,7 @@ async function fastifyStatic (fastify, opts) {
    * @param {number} [rootPathOffset]
    * @param {import("@fastify/send").SendOptions} [pumpOptions]
    * @param {Set<string>} [checkedEncodings]
+   * @param {boolean} [validatePathSpelling]
    */
   async function pumpSendToReply (
     request,
@@ -229,7 +251,8 @@ async function fastifyStatic (fastify, opts) {
     rootPath,
     rootPathOffset = 0,
     pumpOptions,
-    checkedEncodings
+    checkedEncodings,
+    validatePathSpelling = false
   ) {
     const pathnameOrig = pathname
     const normalizedPathname = normalizeRequestPathname(pathname)
@@ -251,8 +274,17 @@ async function fastifyStatic (fastify, opts) {
       return reply.send(forbiddenPathError())
     }
 
-    if (allowedPath && !allowedPath(normalizedPathname, options.root, request)) {
-      return reply.callNotFound()
+    // Absolute Windows filesystem paths are valid inputs for sendFile() and
+    // contain backslashes by design. URL pathnames always start with `/`, so
+    // keep validating those while skipping drive/UNC paths used by sendFile().
+    const isWindowsFilesystemPath = path.win32.isAbsolute(pathname) && !pathname.startsWith('/')
+
+    let basePathSpellingStatus
+    if (validatePathSpelling && !isWindowsFilesystemPath) {
+      basePathSpellingStatus = (await getPathSpellingStatus(pathname, options.root)).status
+      if (basePathSpellingStatus === 'alias' || basePathSpellingStatus === 'unverifiable') {
+        return reply.send(forbiddenPathError())
+      }
     }
 
     let encoding
@@ -278,6 +310,31 @@ async function fastifyStatic (fastify, opts) {
           pathnameForSend = pathname + encodingExtensionMap[encoding]
         }
       }
+    }
+
+    // Directory entries preserve the filesystem's actual spelling even when
+    // path lookup folds case. If the base path is absent, validate the exact
+    // compressed/extension candidate that @fastify/send will try. An exact
+    // base spelling authorizes internally selected compressed siblings.
+    // Static roots are assumed not to be attacker-mutated between this check
+    // and @fastify/send opening the path.
+    if (
+      validatePathSpelling &&
+      !isWindowsFilesystemPath &&
+      basePathSpellingStatus !== 'exact'
+    ) {
+      const pathSpellingStatus = await getSendPathSpellingStatus(
+        pathnameForSend,
+        options.root,
+        options.extensions
+      )
+      if (pathSpellingStatus === 'alias' || pathSpellingStatus === 'unverifiable') {
+        return reply.send(forbiddenPathError())
+      }
+    }
+
+    if (allowedPath && !allowedPath(normalizedPathname, options.root, request)) {
+      return reply.callNotFound()
     }
 
     // `send(..., path, ...)` will URI-decode path so we pass an encoded path here
@@ -319,7 +376,8 @@ async function fastifyStatic (fastify, opts) {
               rootPath,
               undefined,
               undefined,
-              checkedEncodings
+              checkedEncodings,
+              validatePathSpelling
             )
           }
 
@@ -351,7 +409,8 @@ async function fastifyStatic (fastify, opts) {
                   rootPath,
                   undefined,
                   undefined,
-                  checkedEncodings
+                  checkedEncodings,
+                  validatePathSpelling
                 )
               }
             }
@@ -364,7 +423,16 @@ async function fastifyStatic (fastify, opts) {
 
           // root paths left to try?
           if (Array.isArray(rootPath) && rootPathOffset < (rootPath.length - 1)) {
-            return pumpSendToReply(request, reply, pathname, rootPath, rootPathOffset + 1)
+            return pumpSendToReply(
+              request,
+              reply,
+              pathname,
+              rootPath,
+              rootPathOffset + 1,
+              undefined,
+              undefined,
+              validatePathSpelling
+            )
           }
 
           if (opts.preCompressed && !checkedEncodings.has(encoding)) {
@@ -376,7 +444,8 @@ async function fastifyStatic (fastify, opts) {
               rootPath,
               rootPathOffset,
               undefined,
-              checkedEncodings
+              checkedEncodings,
+              validatePathSpelling
             )
           }
 
@@ -557,6 +626,114 @@ function normalizeRequestPathname (pathname) {
   }
 
   return path.posix.normalize(pathname)
+}
+
+/**
+ * @param {string} pathname
+ * @returns {string[]}
+ */
+function getPathSegments (pathname) {
+  // Empty and "." segments do not name a directory entry, and @fastify/send
+  // normalizes them away before it resolves the path.
+  return pathname.split('/').filter(segment => segment !== '' && segment !== '.')
+}
+
+/**
+ * @param {string} pathname
+ * @param {*} root
+ * @returns {Promise<{ status: 'exact'|'missing'|'alias'|'unverifiable' }>}
+ */
+async function getPathSpellingStatus (pathname, root) {
+  if (typeof root !== 'string') {
+    return { status: 'exact' }
+  }
+
+  const segments = getPathSegments(pathname)
+  // A leading ".." escapes the root instead of aliasing an entry inside it.
+  // @fastify/send rejects it, so leave it for send to answer.
+  if (segments[0] === '..') {
+    return { status: 'missing' }
+  }
+
+  let parent = root
+
+  for (const segment of segments) {
+    let entries
+    try {
+      entries = await readdir(parent)
+    } catch (error) {
+      return { status: isMissingPathError(error) ? 'missing' : 'unverifiable' }
+    }
+
+    if (!entries.includes(segment)) {
+      const candidate = path.join(root, ...segments)
+      try {
+        await stat(candidate)
+        return { status: 'alias' }
+      } catch (error) {
+        return { status: isMissingPathError(error) ? 'missing' : 'unverifiable' }
+      }
+    }
+
+    parent = path.join(parent, segment)
+  }
+
+  return { status: 'exact' }
+}
+
+/**
+ * @param {string} pathname
+ * @param {*} root
+ * @param {*} extensions
+ * @returns {Promise<'exact'|'missing'|'alias'|'unverifiable'>}
+ */
+async function getSendPathSpellingStatus (pathname, root, extensions) {
+  let result = await getPathSpellingStatus(pathname, root)
+  // @fastify/send resolves "." segments before it decides whether to try the
+  // configured extensions, so derive the extension candidates the same way.
+  const sendPathname = path.posix.normalize(pathname)
+  if (result.status !== 'missing' || sendPathname.endsWith('/') || path.posix.extname(sendPathname)) {
+    return result.status
+  }
+
+  const extensionList = typeof extensions === 'string'
+    ? [extensions]
+    : Array.isArray(extensions) ? extensions : []
+
+  for (const extension of extensionList) {
+    const extensionPathname = `${sendPathname}.${extension}`
+    result = await getPathSpellingStatus(extensionPathname, root)
+    if (result.status === 'missing') {
+      continue
+    }
+    if (result.status !== 'exact') {
+      return result.status
+    }
+
+    try {
+      const segments = getPathSegments(extensionPathname)
+      if ((await stat(path.join(root, ...segments))).isDirectory()) {
+        continue
+      }
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        continue
+      }
+      return 'unverifiable'
+    }
+
+    return 'exact'
+  }
+
+  return 'missing'
+}
+
+/**
+ * @param {*} error
+ * @returns {boolean}
+ */
+function isMissingPathError (error) {
+  return error?.code === 'ENOENT' || error?.code === 'ENOTDIR'
 }
 
 /**
